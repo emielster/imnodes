@@ -9,9 +9,17 @@
 #include "imnodes_internal.h"
 
 // Check minimum ImGui version
-#define MINIMUM_COMPATIBLE_IMGUI_VERSION 17400
+// Compatibility history:
+//   >= 1.87  (18700): InputEventsQueue/InputEventsTrail, ConfigInputTrickleEventQueue added
+//   >= 1.80  (18000): AddBezierCubic (was AddBezierCurve)
+//   >= 1.82  (18200): ImDrawFlags_RoundCornersXxx (were ImDrawCornerFlags_Xxx)
+//   >= 1.91.0(19100): SetPlatformImeDataFn -> PlatformSetImeDataFn in ImGuiIO
+//   >= 1.91.1(19110): PlatformSetImeDataFn moved to ImGuiPlatformIO; BackendPlatformName is new IO
+//   boundary
+//   >= 1.92  (19200): ImDrawCmd::TextureId -> TexRef, _TextureIdStack -> _TextureStack
+#define MINIMUM_COMPATIBLE_IMGUI_VERSION 18700
 #if IMGUI_VERSION_NUM < MINIMUM_COMPATIBLE_IMGUI_VERSION
-#error "Minimum ImGui version requirement not met -- please use a newer version!"
+#error "Minimum ImGui version requirement not met -- imnodes requires Dear ImGui >= 1.87"
 #endif
 
 #include <limits.h>
@@ -350,6 +358,8 @@ void ImDrawListGrowChannels(ImDrawList* draw_list, const int num_channels)
         {
             ImDrawCmd draw_cmd;
             draw_cmd.ClipRect = draw_list->_ClipRectStack.back();
+// ImDrawCmd::TextureId was replaced by ImDrawCmd::TexRef in Dear ImGui 1.92 (IMGUI_VERSION_NUM
+// 19200). _TextureIdStack was renamed to _TextureStack at the same time.
 #if IMGUI_VERSION_NUM < 19200
             draw_cmd.TextureId = draw_list->_TextureIdStack.back();
 #else
@@ -564,10 +574,7 @@ ImVec2 GetScreenSpacePinCoordinates(const ImNodesEditorContext& editor, const Im
     return GetScreenSpacePinCoordinates(parent_node_rect, pin.AttributeRect, pin.Type);
 }
 
-bool MouseInCanvas()
-{
-    return GImNodes->IsHovered;
-}
+bool MouseInCanvas() { return GImNodes->IsHovered; }
 
 void BeginNodeSelection(ImNodesEditorContext& editor, const int node_idx)
 {
@@ -1861,7 +1868,12 @@ static void MiniMapDrawNode(ImNodesEditorContext& editor, const int node_idx)
         node_rect.Min, node_rect.Max, mini_map_node_background, mini_map_node_rounding);
 
     GImNodes->CanvasDrawList->AddRect(
-        node_rect.Min, node_rect.Max, mini_map_node_outline, mini_map_node_rounding, 0, 1 / editor.ZoomScale);
+        node_rect.Min,
+        node_rect.Max,
+        mini_map_node_outline,
+        mini_map_node_rounding,
+        0,
+        1 / editor.ZoomScale);
 }
 
 static void MiniMapDrawLink(ImNodesEditorContext& editor, const int link_idx)
@@ -2285,23 +2297,47 @@ void BeginNodeEditor()
         GImNodes->CanvasOriginalOrigin = ImGui::GetCursorScreenPos();
         GImNodes->OriginalImgCtx = ImGui::GetCurrentContext();
 
-        // Copy config settings in IO from main context, avoiding input fields
+        // Copy config settings in IO from main context, avoiding backend/platform pointer fields.
+        //
+        // The boundary field used as the copy size limit has moved across Dear ImGui versions:
+        //   < 1.91.0  (IMGUI_VERSION_NUM < 19100):  last config field is SetPlatformImeDataFn
+        //   = 1.91.0  (IMGUI_VERSION_NUM == 19100):  renamed to PlatformSetImeDataFn (still in
+        //   ImGuiIO)
+        //   >= 1.91.1 (IMGUI_VERSION_NUM >= 19110):  PlatformSetImeDataFn moved to ImGuiPlatformIO;
+        //                                            BackendPlatformName is the new safe boundary
+        //                                            (it is the first backend/platform pointer
+        //                                            field)
+#if IMGUI_VERSION_NUM >= 19110
+        memcpy(
+            (void*)&GImNodes->NodeEditorImgCtx->IO,
+            (void*)&GImNodes->OriginalImgCtx->IO,
+            offsetof(ImGuiIO, BackendPlatformName));
+#elif IMGUI_VERSION_NUM >= 19100
+        memcpy(
+            (void*)&GImNodes->NodeEditorImgCtx->IO,
+            (void*)&GImNodes->OriginalImgCtx->IO,
+            offsetof(ImGuiIO, PlatformSetImeDataFn) +
+                sizeof(GImNodes->OriginalImgCtx->IO.PlatformSetImeDataFn));
+#else
         memcpy(
             (void*)&GImNodes->NodeEditorImgCtx->IO,
             (void*)&GImNodes->OriginalImgCtx->IO,
             offsetof(ImGuiIO, SetPlatformImeDataFn) +
                 sizeof(GImNodes->OriginalImgCtx->IO.SetPlatformImeDataFn));
+#endif
 
         GImNodes->NodeEditorImgCtx->IO.BackendPlatformUserData = nullptr;
         GImNodes->NodeEditorImgCtx->IO.BackendRendererUserData = nullptr;
         GImNodes->NodeEditorImgCtx->IO.IniFilename = nullptr;
         GImNodes->NodeEditorImgCtx->IO.ConfigInputTrickleEventQueue = false;
-        GImNodes->NodeEditorImgCtx->IO.DisplaySize = ImMax(canvas_size / editor.ZoomScale, ImVec2(0, 0));
+        GImNodes->NodeEditorImgCtx->IO.DisplaySize =
+            ImMax(canvas_size / editor.ZoomScale, ImVec2(0, 0));
         GImNodes->NodeEditorImgCtx->Style = GImNodes->OriginalImgCtx->Style;
 
         // Nav (tabbing) needs to be disabled otherwise it doubles up with the main context
         // not sure how to get this working correctly
-        ImGuiWindowFlags windowFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags windowFlags = ImGuiWindowFlags_NoDecoration |
+                                       ImGuiWindowFlags_NoSavedSettings |
                                        ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoMove;
 
         // Button to capture mouse events and hover test
@@ -2309,7 +2345,7 @@ void BeginNodeEditor()
 
         if (ImGui::IsWindowHovered())
         {
-            GImNodes->IsHovered = true;            
+            GImNodes->IsHovered = true;
         }
         else
         {
@@ -2326,7 +2362,7 @@ void BeginNodeEditor()
                 e.MousePos.PosX =
                     (e.MousePos.PosX - GImNodes->CanvasOriginalOrigin.x) / editor.ZoomScale;
                 e.MousePos.PosY =
-                    (e.MousePos.PosY - GImNodes->CanvasOriginalOrigin.y) / editor.ZoomScale;                
+                    (e.MousePos.PosY - GImNodes->CanvasOriginalOrigin.y) / editor.ZoomScale;
             }
         }
 
@@ -2927,7 +2963,7 @@ void EditorContextSetZoom(float zoom_scale, ImVec2 zoom_centering_pos)
     IM_ASSERT(GImNodes->CurrentScope == ImNodesScope_None);
 
     ImNodesEditorContext& editor = EditorContextGet();
-    const float new_zoom = ImMax(0.1f, ImMin(10.0f, zoom_scale));
+    const float           new_zoom = ImMax(0.1f, ImMin(10.0f, zoom_scale));
 
     zoom_centering_pos -= GImNodes->CanvasOriginalOrigin;
     editor.Panning += zoom_centering_pos / new_zoom - zoom_centering_pos / editor.ZoomScale;
@@ -2945,7 +2981,7 @@ ImVec2 ConvertToEditorContextSpace(const ImVec2& screen_space_pos)
 
 ImVec2 ConvertFromEditorContextSpace(const ImVec2& screen_space_pos)
 {
-    return (screen_space_pos * EditorContextGet().ZoomScale) + GImNodes->CanvasOriginalOrigin;    
+    return (screen_space_pos * EditorContextGet().ZoomScale) + GImNodes->CanvasOriginalOrigin;
 }
 
 bool IsEditorHovered() { return MouseInCanvas(); }
